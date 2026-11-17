@@ -428,4 +428,62 @@ async def admin_stats(message: Message) -> None:
     db: Database = dp["db"]
     s = await db.get_stats()
     text = (
-        f"📊 <b>Statistika:</b>\n\n
+        f"📊 <b>Statistika:</b>\n\n"
+        f"👥 Foydalanuvchilar: {s['users']}\n"
+        f"📦 Mahsulotlar: {s['products']}\n"
+        f"📁 Kategoriyalar: {s['categories']}\n"
+        f"🛒 Jami buyurtmalar: {s['orders']}\n"
+        f"📥 Bugungi buyurtmalar: {s['orders_today']}\n"
+        f"💰 Tushum: {format_price(s['revenue'])}"
+    )
+    await message.answer(text)
+
+# --- MAIN ---
+async def main() -> None:
+    db = Database(DB_PATH)
+    await db.init()
+    dp["db"] = db
+
+    # Register handlers
+    dp.register_message_handler(cmd_start, commands=["start"])
+    dp.register_message_handler(cmd_about, text=BTN_ABOUT)
+    dp.register_message_handler(cmd_contacts, text=BTN_CONTACTS)
+    dp.register_message_handler(cmd_catalog, text=BTN_CATALOG)
+
+    dp.register_callback_query_handler(show_category_products, lambda c: c.data and c.data.startswith("cat:"))
+    dp.register_callback_query_handler(back_to_categories, text="back:cats")
+    dp.register_callback_query_handler(start_order, lambda c: c.data and c.data.startswith("order:"))
+
+    dp.register_message_handler(cancel_order, text=BTN_CANCEL, state="*")
+    dp.register_message_handler(process_phone, state=OrderStates.phone)
+    dp.register_message_handler(process_comment, state=OrderStates.comment)
+
+    dp.register_message_handler(cmd_admin, commands=["admin"])
+    dp.register_message_handler(exit_admin, text=BTN_EXIT_ADMIN)
+    dp.register_message_handler(admin_stats, text=BTN_STATS)
+
+    # Webhook server for Render (if needed, or standard polling)
+    # Aiohttp app to satisfy Render web service port binding requirement
+    app = web.Application()
+    
+    async def handle_ping(request):
+        return web.Response(text="Bot is running!")
+    
+    app.router.add_get("/", handle_ping)
+    
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    logging.info(f"Web server started on port {port}")
+    
+    try:
+        await dp.start_polling()
+    finally:
+        await bot.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
