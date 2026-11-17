@@ -7,7 +7,6 @@ from html import escape
 from typing import Optional, Any
 import sqlite3
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -281,18 +280,6 @@ def cancel_kb() -> ReplyKeyboardMarkup:
     kb.add(KeyboardButton(BTN_CANCEL))
     return kb
 
-def delete_list_kb(products) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=1)
-    for p in products:
-        kb.add(InlineKeyboardButton(f"🗑 #{p['id']} {p['name'][:28]} — {format_price(p['price'])}", callback_data=f"del:{p['id']}"))
-    return kb
-
-def confirm_delete_kb(product_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(InlineKeyboardButton("✅ Yes, delete", callback_data=f"delok:{product_id}"),
-           InlineKeyboardButton("↩️ No", callback_data="delno"))
-    return kb
-
 # --- BOT SETUP ---
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 storage = MemoryStorage()
@@ -462,23 +449,7 @@ async def main() -> None:
     dp.register_message_handler(exit_admin, text=BTN_EXIT_ADMIN)
     dp.register_message_handler(admin_stats, text=BTN_STATS)
 
-    # Webhook server for Render (if needed, or standard polling)
-    # Aiohttp app to satisfy Render web service port binding requirement
-    app = web.Application()
-    
-    async def handle_ping(request):
-        return web.Response(text="Bot is running!")
-    
-    app.router.add_get("/", handle_ping)
-    
-    port = int(os.environ.get("PORT", 10000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-    logging.info(f"Web server started on port {port}")
-    
+    logging.info("Starting bot polling...")
     try:
         await dp.start_polling()
     finally:
@@ -486,4 +457,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
