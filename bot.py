@@ -23,7 +23,7 @@ from aiogram.utils import executor
 
 # --- CONFIG ---
 BOT_TOKEN = "9087065515:AAHlQQPUtprWZZT3Qe9JrAeX1RidGDcU2xM"
-ADMIN_IDS = [6401643766, 7306881346]  # Adminlar ro'yxati (Siz va opa)
+ADMIN_IDS = [6401643766, 7306881346]
 DB_PATH = "stilshop.db"
 
 SHOP_NAME = "StilShop"
@@ -207,7 +207,6 @@ def product_caption(p) -> str:
         f"💰 <b>{format_price(p['price'])}</b>"
     )
 
-# --- STATES ---
 class OrderStates(StatesGroup):
     phone = State()
     comment = State()
@@ -219,7 +218,6 @@ class AddProduct(StatesGroup):
     price = State()
     photo = State()
 
-# --- KEYBOARDS ---
 BTN_CATALOG = "🛍 Catalog"
 BTN_ABOUT = "ℹ️ About Us"
 BTN_CONTACTS = "📞 Contacts"
@@ -280,11 +278,9 @@ def cancel_kb() -> ReplyKeyboardMarkup:
     kb.add(KeyboardButton(BTN_CANCEL))
     return kb
 
-# --- BOT SETUP ---
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
-
 # --- HANDLERS: USER ---
 async def cmd_start(message: Message) -> None:
     db: Database = dp["db"]
@@ -388,7 +384,6 @@ async def process_comment(message: Message, state: FSMContext) -> None:
 
     await message.answer("✅ Buyurtmangiz muvaffaqiyatli qabul qilindi! Tez orada operatorlarimiz siz bilan bog'lanishadi.", reply_markup=main_menu())
 
-    # Barcha adminlarga xabar yuborish
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -429,7 +424,6 @@ async def admin_stats(message: Message) -> None:
     )
     await message.answer(text)
 
-# Tovar qo'shish FSM
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == BTN_ADD)
 async def start_add_product(message: Message):
     await message.answer("Yangi tovar nomini kiriting:", reply_markup=cancel_kb())
@@ -475,7 +469,6 @@ async def save_product_handler(message: Message, state: FSMContext):
     await message.answer("✅ Tovar muvaffaqiyatli qo'shildi!", reply_markup=admin_menu_kb())
     await state.finish()
 
-# Tovarni o'chirish
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == BTN_DELETE)
 async def list_products_to_delete(message: Message):
     db: Database = dp["db"]
@@ -501,7 +494,6 @@ async def delete_product_callback(callback: CallbackQuery):
     await callback.answer("Tovar o'chirildi!", show_alert=True)
     await callback.message.edit_text("✅ Tovar muvaffaqiyatli o'chirib tashlandi.")
 
-# Barcha mahsulotlarni ko'rish
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == BTN_ALL)
 async def admin_all_products(message: Message):
     db: Database = dp["db"]
@@ -515,19 +507,36 @@ async def admin_all_products(message: Message):
             caption=product_caption(p)
         )
 
-
 # --- MAIN ---
 async def main() -> None:
     db = Database(DB_PATH)
     await db.init()
     dp["db"] = db
 
-    # Register handlers
     dp.register_message_handler(cmd_start, commands=["start"])
     dp.register_message_handler(cmd_about, text=BTN_ABOUT)
     dp.register_message_handler(cmd_contacts, text=BTN_CONTACTS)
     dp.register_message_handler(cmd_catalog, text=BTN_CATALOG)
     
-    # Admin commands & Exit
     dp.register_message_handler(cmd_admin, commands=["admin"])
-    dp.register_message_handler(cmd_a
+    dp.register_message_handler(cmd_admin, text=BTN_ADD)
+    dp.register_message_handler(exit_admin, text=BTN_EXIT_ADMIN)
+    dp.register_message_handler(admin_stats, text=BTN_STATS)
+    dp.register_message_handler(cancel_order, text=BTN_CANCEL, state="*")
+
+    dp.register_callback_query_handler(start_order, lambda c: c.data and c.data.startswith("order:"))
+    dp.register_message_handler(process_phone, state=OrderStates.phone, content_types=['text', 'contact'])
+    dp.register_message_handler(process_comment, state=OrderStates.comment)
+
+    dp.register_callback_query_handler(show_category_products, lambda c: c.data and c.data.startswith("cat:"))
+    dp.register_callback_query_handler(back_to_categories, lambda c: c.data == "back:cats")
+
+    print("Bot ishga tushdi...")
+    try:
+        await dp.start_polling()
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
