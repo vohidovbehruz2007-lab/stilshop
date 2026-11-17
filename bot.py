@@ -448,7 +448,115 @@ async def main() -> None:
     dp.register_message_handler(cmd_admin, commands=["admin"])
     dp.register_message_handler(exit_admin, text=BTN_EXIT_ADMIN)
     dp.register_message_handler(admin_stats, text=BTN_STATS)
+# --- ADMIN PANEL & BOSHQARUV ---
 
+# 1. /admin buyrug'i (Faqat sizga ishlaydi)
+@dp.message_handler(commands=['admin'])
+async def admin_panel(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Kechirasiz, siz admin emassiz!")
+        return
+
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(
+        KeyboardButton("➕ Tovar qo'shish"),
+        KeyboardButton("🗑 Tovarni o'chirish"),
+        KeyboardButton("📞 Nomeri o'zgartirish"),
+        KeyboardButton("🔙 Asosiy menyu")
+    )
+    await message.answer("🛠 **Admin panelga xush kelibsiz!** Kerakli amalni tanlang:", reply_markup=keyboard, parse_mode="HTML")
+
+# Asosiy menyuga qaytish
+@dp.message_handler(lambda message: message.text == "🔙 Asosiy menyu")
+async def back_to_main(message: types.Message):
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(KeyboardButton("🛍 Katalog"), KeyboardButton("📞 Contacts"), KeyboardButton("ℹ️ About Us"))
+    if message.from_user.id == ADMIN_ID:
+        keyboard.add(KeyboardButton("🛠 Admin Panel"))
+    await message.answer("Asosiy menyu:", reply_markup=keyboard)
+
+
+# --- 2. TOVAR QO'SHISH ---
+class AddProduct(StatesGroup):
+    name = State()
+    price = State()
+    photo = State()
+
+@dp.message_handler(lambda message: message.from_user.id == ADMIN_ID and message.text == "➕ Tovar qo'shish")
+async def start_add_product(message: types.Message):
+    await message.answer("Yangi tovar nomini kiriting:")
+    await AddProduct.name.set()
+
+@dp.message_handler(state=AddProduct.name)
+async def set_product_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Endi tovar narxini kiriting (masalan: 150 000 so'm):")
+    await AddProduct.price.set()
+
+@dp.message_handler(state=AddProduct.price)
+async def set_product_price(message: types.Message, state: FSMContext):
+    await state.update_data(price=message.text)
+    await message.answer("Endi tovar rasmini yuboring:")
+    await AddProduct.photo.set()
+
+@dp.message_handler(content_types=['photo'], state=AddProduct.photo)
+async def save_product(message: types.Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    data = await state.get_data()
+    
+    # Bazaga saqlash
+    cursor.execute("INSERT INTO products (name, price, photo) VALUES (?, ?, ?)", 
+                   (data['name'], data['price'], photo_id))
+    db.commit()
+    
+    await message.answer("✅ Tovar muvaffaqiyatli qo'shildi!")
+    await state.finish()
+
+
+# --- 3. TOVARNI O'CHIRISH ---
+@dp.message_handler(lambda message: message.from_user.id == ADMIN_ID and message.text == "🗑 Tovarni o'chirish")
+async def list_products_to_delete(message: types.Message):
+    cursor.execute("SELECT id, name FROM products")
+    products = cursor.fetchall()
+    if not products:
+        await message.answer("Hozircha o'chirish uchun tovarlar yo'q.")
+        return
+    
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    for p in products:
+        keyboard.add(InlineKeyboardButton(text=f"❌ O'chirish: {p[1]}", callback_data=f"del_{p[0]}"))
+    
+    await message.answer("O'chirmoqchi bo'lgan tovarni tanlang:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('del_') and c.from_user.id == ADMIN_ID)
+async def delete_product_callback(callback: types.CallbackQuery):
+    product_id = int(callback.data.split('_')[1])
+    cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
+    db.commit()
+    await callback.answer("Tovar o'chirildi!", show_alert=True)
+    await callback.message.edit_text("✅ Tovar muvaffaqiyatli o'chirib tashlandi.")
+
+
+# --- 4. TELEFON NOMerni O'ZGARTIRISH ---
+class ChangePhone(StatesGroup):
+    phone = State()
+
+@dp.message_handler(lambda message: message.from_user.id == ADMIN_ID and message.text == "📞 Nomeri o'zgartirish")
+async def start_change_phone(message: types.Message):
+    await message.answer("Yangi telefon raqamini kiriting (masalan: +998 90 123 45 67):")
+    await ChangePhone.phone.set()
+
+@dp.message_handler(state=ChangePhone.phone)
+async def save_new_phone(message: types.Message, state: FSMContext):
+    new_phone = message.text
+    # Bazaga yoki o'zgaruvchiga saqlash (bu yerda shunchaki tasdiqlaymiz)
+    # Global o'zgaruvchi orqali ham yangilab qo'yish mumkin
+    global ADMIN_PHONE
+    ADMIN_PHONE = new_phone
+    
+    await message.answer(f"✅ Telefon raqami muvaffaqiyatli o'zgartirildi: {new_phone}")
+    await state.finish()
+    
     logging.info("Starting bot polling...")
     try:
         await dp.start_polling()
