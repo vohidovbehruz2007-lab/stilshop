@@ -23,7 +23,7 @@ from aiogram.utils import executor
 
 # --- CONFIG ---
 BOT_TOKEN = "9087065515:AAHlQQPUtprWZZT3Qe9JrAeX1RidGDcU2xM"
-ADMIN_ID = 0  # O'z Telegram ID raqamingizni yozishingiz mumkin
+ADMIN_IDS = [6401643766, 7306881346]  # Adminlar ro'yxati (Siz va opa)
 DB_PATH = "stilshop.db"
 
 SHOP_NAME = "StilShop"
@@ -388,10 +388,11 @@ async def process_comment(message: Message, state: FSMContext) -> None:
 
     await message.answer("✅ Buyurtmangiz muvaffaqiyatli qabul qilindi! Tez orada operatorlarimiz siz bilan bog'lanishadi.", reply_markup=main_menu())
 
-    if ADMIN_ID:
+    # Barcha adminlarga xabar yuborish
+    for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
-                ADMIN_ID,
+                admin_id,
                 f"🚨 <b>Yangi buyurtma!</b>\n\n"
                 f"🛍 Mahsulot: {product['name']}\n"
                 f"💰 Narxi: {format_price(product['price'])}\n"
@@ -402,9 +403,10 @@ async def process_comment(message: Message, state: FSMContext) -> None:
         except Exception:
             pass
 
-# --- HANDLERS: ADMIN ---
+# --- HANDLERS: ADMIN PANEL ---
 async def cmd_admin(message: Message) -> None:
-    if ADMIN_ID and message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Kechirasiz, siz admin emassiz!")
         return
     await message.answer("👑 Admin paneliga xush kelibsiz!", reply_markup=admin_menu_kb())
 
@@ -412,6 +414,8 @@ async def exit_admin(message: Message) -> None:
     await message.answer("Admin panelidan chiqildi.", reply_markup=main_menu())
 
 async def admin_stats(message: Message) -> None:
+    if message.from_user.id not in ADMIN_IDS:
+        return
     db: Database = dp["db"]
     s = await db.get_stats()
     text = (
@@ -424,6 +428,93 @@ async def admin_stats(message: Message) -> None:
         f"💰 Tushum: {format_price(s['revenue'])}"
     )
     await message.answer(text)
+
+# Tovar qo'shish FSM
+@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == BTN_ADD)
+async def start_add_product(message: Message):
+    await message.answer("Yangi tovar nomini kiriting:", reply_markup=cancel_kb())
+    await AddProduct.name.set()
+
+@dp.message_handler(state=AddProduct.name)
+async def set_product_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Endi tovar kategoriyasini kiriting (masalan: Kiyimlar):")
+    await AddProduct.category.set()
+
+@dp.message_handler(state=AddProduct.category)
+async def set_product_category(message: Message, state: FSMContext):
+    await state.update_data(category=message.text)
+    await message.answer("Tovar uchun qisqacha tavsif (description) kiriting:")
+    await AddProduct.description.set()
+
+@dp.message_handler(state=AddProduct.description)
+async def set_product_description(message: Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await message.answer("Tovar narxini raqamlarda kiriting (masalan: 150000):")
+    await AddProduct.price.set()
+
+@dp.message_handler(state=AddProduct.price)
+async def set_product_price(message: Message, state: FSMContext):
+    price = parse_price(message.text)
+    if not price:
+        await message.answer("Iltimos, narxni to'g'ri raqam shaklida kiriting:")
+        return
+    await state.update_data(price=price)
+    await message.answer("Endi tovar rasmini (foto) yuboring:")
+    await AddProduct.photo.set()
+
+@dp.message_handler(content_types=['photo'], state=AddProduct.photo)
+async def save_product_handler(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    data = await state.get_data()
+    db: Database = dp["db"]
+    
+    cat_id = await db.get_or_create_category(data["category"])
+    await db.add_product(data["name"], cat_id, data["description"], data["price"], photo_id)
+    
+    await message.answer("✅ Tovar muvaffaqiyatli qo'shildi!", reply_markup=admin_menu_kb())
+    await state.finish()
+
+# Tovarni o'chirish
+@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == BTN_DELETE)
+async def list_products_to_delete(message: Message):
+    db: Database = dp["db"]
+    products = await db.get_all_products()
+    if not products:
+        await message.answer("Hozircha o'chirish uchun tovarlar yo'q.", reply_markup=admin_menu_kb())
+        return
+    
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    for p in products:
+        keyboard.add(InlineKeyboardButton(text=f"❌ O'chirish: {p['name']} ({format_price(p['price'])})", callback_data=f"delprod:{p['id']}"))
+    
+    await message.answer("O'chirmoqchi bo'lgan tovarni tanlang:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("delprod:"))
+async def delete_product_callback(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Siz admin emassiz!", show_alert=True)
+        return
+    product_id = int(callback.data.split(":")[1])
+    db: Database = dp["db"]
+    await db.delete_product(product_id)
+    await callback.answer("Tovar o'chirildi!", show_alert=True)
+    await callback.message.edit_text("✅ Tovar muvaffaqiyatli o'chirib tashlandi.")
+
+# Barcha mahsulotlarni ko'rish
+@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == BTN_ALL)
+async def admin_all_products(message: Message):
+    db: Database = dp["db"]
+    products = await db.get_all_products()
+    if not products:
+        await message.answer("Hozircha tovarlar mavjud emas.")
+        return
+    for p in products:
+        await message.answer_photo(
+            photo=p["photo_id"],
+            caption=product_caption(p)
+        )
+
 
 # --- MAIN ---
 async def main() -> None:
@@ -438,131 +529,4 @@ async def main() -> None:
     dp.register_message_handler(cmd_catalog, text=BTN_CATALOG)
 
     dp.register_callback_query_handler(show_category_products, lambda c: c.data and c.data.startswith("cat:"))
-    dp.register_callback_query_handler(back_to_categories, text="back:cats")
-    dp.register_callback_query_handler(start_order, lambda c: c.data and c.data.startswith("order:"))
-
-    dp.register_message_handler(cancel_order, text=BTN_CANCEL, state="*")
-    dp.register_message_handler(process_phone, state=OrderStates.phone)
-    dp.register_message_handler(process_comment, state=OrderStates.comment)
-
-    dp.register_message_handler(cmd_admin, commands=["admin"])
-    dp.register_message_handler(exit_admin, text=BTN_EXIT_ADMIN)
-    dp.register_message_handler(admin_stats, text=BTN_STATS)
-# --- ADMIN PANEL & BOSHQARUV ---
-
-# 1. /admin buyrug'i (Faqat sizga ishlaydi)
-@dp.message_handler(commands=['admin'])
-async def admin_panel(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Kechirasiz, siz admin emassiz!")
-        return
-
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(
-        KeyboardButton("➕ Tovar qo'shish"),
-        KeyboardButton("🗑 Tovarni o'chirish"),
-        KeyboardButton("📞 Nomeri o'zgartirish"),
-        KeyboardButton("🔙 Asosiy menyu")
-    )
-    await message.answer("🛠 **Admin panelga xush kelibsiz!** Kerakli amalni tanlang:", reply_markup=keyboard, parse_mode="HTML")
-
-# Asosiy menyuga qaytish
-@dp.message_handler(lambda message: message.text == "🔙 Asosiy menyu")
-async def back_to_main(message: types.Message):
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(KeyboardButton("🛍 Katalog"), KeyboardButton("📞 Contacts"), KeyboardButton("ℹ️ About Us"))
-    if message.from_user.id == ADMIN_ID:
-        keyboard.add(KeyboardButton("🛠 Admin Panel"))
-    await message.answer("Asosiy menyu:", reply_markup=keyboard)
-
-
-# --- 2. TOVAR QO'SHISH ---
-class AddProduct(StatesGroup):
-    name = State()
-    price = State()
-    photo = State()
-
-@dp.message_handler(lambda message: message.from_user.id == ADMIN_ID and message.text == "➕ Tovar qo'shish")
-async def start_add_product(message: types.Message):
-    await message.answer("Yangi tovar nomini kiriting:")
-    await AddProduct.name.set()
-
-@dp.message_handler(state=AddProduct.name)
-async def set_product_name(message: types.Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await message.answer("Endi tovar narxini kiriting (masalan: 150 000 so'm):")
-    await AddProduct.price.set()
-
-@dp.message_handler(state=AddProduct.price)
-async def set_product_price(message: types.Message, state: FSMContext):
-    await state.update_data(price=message.text)
-    await message.answer("Endi tovar rasmini yuboring:")
-    await AddProduct.photo.set()
-
-@dp.message_handler(content_types=['photo'], state=AddProduct.photo)
-async def save_product(message: types.Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    data = await state.get_data()
-    
-    # Bazaga saqlash
-    cursor.execute("INSERT INTO products (name, price, photo) VALUES (?, ?, ?)", 
-                   (data['name'], data['price'], photo_id))
-    db.commit()
-    
-    await message.answer("✅ Tovar muvaffaqiyatli qo'shildi!")
-    await state.finish()
-
-
-# --- 3. TOVARNI O'CHIRISH ---
-@dp.message_handler(lambda message: message.from_user.id == ADMIN_ID and message.text == "🗑 Tovarni o'chirish")
-async def list_products_to_delete(message: types.Message):
-    cursor.execute("SELECT id, name FROM products")
-    products = cursor.fetchall()
-    if not products:
-        await message.answer("Hozircha o'chirish uchun tovarlar yo'q.")
-        return
-    
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    for p in products:
-        keyboard.add(InlineKeyboardButton(text=f"❌ O'chirish: {p[1]}", callback_data=f"del_{p[0]}"))
-    
-    await message.answer("O'chirmoqchi bo'lgan tovarni tanlang:", reply_markup=keyboard)
-
-@dp.callback_query_handler(lambda c: c.data.startswith('del_') and c.from_user.id == ADMIN_ID)
-async def delete_product_callback(callback: types.CallbackQuery):
-    product_id = int(callback.data.split('_')[1])
-    cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
-    db.commit()
-    await callback.answer("Tovar o'chirildi!", show_alert=True)
-    await callback.message.edit_text("✅ Tovar muvaffaqiyatli o'chirib tashlandi.")
-
-
-# --- 4. TELEFON NOMerni O'ZGARTIRISH ---
-class ChangePhone(StatesGroup):
-    phone = State()
-
-@dp.message_handler(lambda message: message.from_user.id == ADMIN_ID and message.text == "📞 Nomeri o'zgartirish")
-async def start_change_phone(message: types.Message):
-    await message.answer("Yangi telefon raqamini kiriting (masalan: +998 90 123 45 67):")
-    await ChangePhone.phone.set()
-
-@dp.message_handler(state=ChangePhone.phone)
-async def save_new_phone(message: types.Message, state: FSMContext):
-    new_phone = message.text
-    # Bazaga yoki o'zgaruvchiga saqlash (bu yerda shunchaki tasdiqlaymiz)
-    # Global o'zgaruvchi orqali ham yangilab qo'yish mumkin
-    global ADMIN_PHONE
-    ADMIN_PHONE = new_phone
-    
-    await message.answer(f"✅ Telefon raqami muvaffaqiyatli o'zgartirildi: {new_phone}")
-    await state.finish()
-    
-    logging.info("Starting bot polling...")
-    try:
-        await dp.start_polling()
-    finally:
-        await bot.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
-        
+    dp.register_callb
