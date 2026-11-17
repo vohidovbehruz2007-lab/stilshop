@@ -527,6 +527,7 @@ async def main() -> None:
     dp.register_message_handler(cmd_about, text=BTN_ABOUT)
     dp.register_message_handler(cmd_contacts, text=BTN_CONTACTS)
     dp.register_message_handler(cmd_catalog, text=BTN_CATALOG)
-
-    dp.register_callback_query_handler(show_category_products, lambda c: c.data and c.data.startswith("cat:"))
-    dp.register_callb
+    
+    # Admin commands & Exit
+    dp.register_message_handler(cmd_admin, commands=["admin"])
+    dp.register_message_handler(cmd_a
