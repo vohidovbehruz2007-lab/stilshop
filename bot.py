@@ -2,10 +2,10 @@ import asyncio
 import logging
 import os
 import re
+import sqlite3
 from contextlib import closing
 from html import escape
-from typing import Optional, Any
-import sqlite3
+from typing import Any, Optional
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -13,36 +13,33 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
 )
 from aiogram.utils import executor
 
-# --- CONFIG ---
-BOT_TOKEN = "9087065515:AAHlQQPUtprWZZT3Qe9JrAeX1RidGDcU2xM"
+logging.basicConfig(level=logging.INFO)
+
+# ================= CONFIG =================
+# Token Render -> Environment -> BOT_TOKEN ga qo'yiladi
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = [6401643766, 7306881346]
-DB_PATH = "stilshop.db"
+DB_PATH = os.getenv("DB_PATH", "stilshop.db")
 
 SHOP_NAME = "StilShop"
 PAGE_SIZE = 5
 
 ABOUT_TEXT = (
     f"🏬 <b>{SHOP_NAME}</b>\n\n"
-    "We offer stylish, high-quality products at fair prices "
-    "with fast delivery across Uzbekistan.\n\n"
-    "✅ Quality guaranteed\n🚚 Fast delivery\n💬 Friendly support"
-)
-CONTACTS_TEXT = (
-    "📞 <b>Contacts</b>\n\n"
-    "Telegram: @StilShopUz_bot\n"
-    "Phone: +998 90 000 00 00\n"
-    "Working hours: 09:00 – 21:00"
+    "Biz sizga sifatli va zamonaviy mahsulotlarni hamyonbop narxlarda "
+    "taklif qilamiz. O'zbekiston bo'ylab tez yetkazib berish.\n\n"
+    "✅ Sifat kafolati\n🚚 Tez yetkazib berish\n💬 Do'stona xizmat"
 )
 
-# --- DATABASE ---
+# ================= DATABASE =================
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_id    INTEGER PRIMARY KEY,
@@ -73,6 +70,10 @@ CREATE TABLE IF NOT EXISTS orders (
     comment       TEXT DEFAULT '',
     created_at    TEXT DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT
+);
 """
 
 _PRODUCT_SELECT = """
@@ -80,6 +81,7 @@ SELECT p.id, p.name, p.description, p.price, p.photo_id,
        p.category_id, c.name AS category
 FROM products p JOIN categories c ON c.id = p.category_id
 """
+
 
 class Database:
     def __init__(self, path: str) -> None:
@@ -104,9 +106,27 @@ class Database:
     async def _run(self, sql: str, params: tuple = (), fetch: str = "none") -> Any:
         return await asyncio.to_thread(self._execute, sql, params, fetch)
 
-    async def init(self) -> None:
-        await asyncio.to_thread(lambda: sqlite3.connect(self.path).executescript(SCHEMA))
+    def _init_sync(self) -> None:
+        with closing(sqlite3.connect(self.path)) as conn:
+            conn.executescript(SCHEMA)
+            conn.commit()
 
+    async def init(self) -> None:
+        await asyncio.to_thread(self._init_sync)
+
+    # --- settings ---
+    async def get_setting(self, key: str, default: str = "") -> str:
+        row = await self._run("SELECT value FROM settings WHERE key = ?", (key,), "one")
+        return row["value"] if row else default
+
+    async def set_setting(self, key: str, value: str) -> None:
+        await self._run(
+            """INSERT INTO settings (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (key, value),
+        )
+
+    # --- users ---
     async def upsert_user(self, user_id: int, full_name: str, username: Optional[str]) -> None:
         await self._run(
             """INSERT INTO users (user_id, full_name, username) VALUES (?, ?, ?)
@@ -115,6 +135,7 @@ class Database:
             (user_id, full_name, username),
         )
 
+    # --- categories / products ---
     async def get_or_create_category(self, name: str) -> int:
         name = name.strip()
         row = await self._run("SELECT id FROM categories WHERE name = ?", (name,), "one")
@@ -122,16 +143,15 @@ class Database:
             return row["id"]
         return await self._run("INSERT INTO categories (name) VALUES (?)", (name,))
 
-    async def get_categories(self, only_nonempty: bool = True):
-        join = "JOIN" if only_nonempty else "LEFT JOIN"
+    async def get_categories(self):
         return await self._run(
-            f"""SELECT c.id, c.name, COUNT(p.id) AS cnt FROM categories c
-                {join} products p ON p.category_id = c.id
-                GROUP BY c.id ORDER BY c.name""",
+            """SELECT c.id, c.name, COUNT(p.id) AS cnt FROM categories c
+               JOIN products p ON p.category_id = c.id
+               GROUP BY c.id ORDER BY c.name""",
             fetch="all",
         )
 
-    async def add_product(self, name: str, category_id: int, description: str, price: int, photo_id: str) -> int:
+    async def add_product(self, name, category_id, description, price, photo_id) -> int:
         return await self._run(
             """INSERT INTO products (name, category_id, description, price, photo_id)
                VALUES (?, ?, ?, ?, ?)""",
@@ -144,7 +164,8 @@ class Database:
     async def get_products_by_category(self, category_id: int, limit: int, offset: int):
         return await self._run(
             _PRODUCT_SELECT + " WHERE p.category_id = ? ORDER BY p.id DESC LIMIT ? OFFSET ?",
-            (category_id, limit, offset), "all",
+            (category_id, limit, offset),
+            "all",
         )
 
     async def count_products_in_category(self, category_id: int) -> int:
@@ -153,11 +174,8 @@ class Database:
         )
         return row["n"]
 
-    async def get_all_products(self, limit: Optional[int] = None):
-        sql = _PRODUCT_SELECT + " ORDER BY c.name, p.id DESC"
-        if limit:
-            sql += f" LIMIT {int(limit)}"
-        return await self._run(sql, fetch="all")
+    async def get_all_products(self):
+        return await self._run(_PRODUCT_SELECT + " ORDER BY c.name, p.id DESC", fetch="all")
 
     async def delete_product(self, product_id: int) -> bool:
         deleted = await self._run("DELETE FROM products WHERE id = ?", (product_id,), "count")
@@ -166,6 +184,7 @@ class Database:
         )
         return deleted > 0
 
+    # --- orders / stats ---
     async def create_order(self, user_id: int, product, phone: str, comment: str) -> int:
         return await self._run(
             """INSERT INTO orders (user_id, product_id, product_name, price, phone, comment)
@@ -186,15 +205,23 @@ class Database:
         )
         return dict(row)
 
-# --- UTILS ---
+
+# ================= UTILS =================
 def format_price(price: int) -> str:
     return f"{price:,}".replace(",", " ") + " so'm"
 
+
 def parse_price(text: str) -> Optional[int]:
-    digits = re.sub(r"[\s,']", "", text)
+    digits = re.sub(r"[\s,']", "", text or "")
     if digits.isdigit() and int(digits) > 0:
         return int(digits)
     return None
+
+
+def valid_phone(text: str) -> bool:
+    digits = re.sub(r"\D", "", text or "")
+    return 9 <= len(digits) <= 15
+
 
 def product_caption(p) -> str:
     desc = p["description"]
@@ -207,9 +234,16 @@ def product_caption(p) -> str:
         f"💰 <b>{format_price(p['price'])}</b>"
     )
 
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+# ================= STATES =================
 class OrderStates(StatesGroup):
     phone = State()
     comment = State()
+
 
 class AddProduct(StatesGroup):
     name = State()
@@ -218,18 +252,26 @@ class AddProduct(StatesGroup):
     price = State()
     photo = State()
 
-BTN_CATALOG = "🛍 Catalog"
-BTN_ABOUT = "ℹ️ About Us"
-BTN_CONTACTS = "📞 Contacts"
-BTN_CANCEL = "❌ Cancel"
-BTN_SKIP = "⏭ Skip"
-BTN_SEND_PHONE = "📱 Share my number"
 
-BTN_ADD = "➕ Add Product"
-BTN_DELETE = "🗑 Delete Product"
-BTN_ALL = "📦 View All Products"
-BTN_STATS = "📊 Statistics"
-BTN_EXIT_ADMIN = "⬅️ Exit admin"
+class SetShopPhone(StatesGroup):
+    phone = State()
+
+
+# ================= BUTTONS =================
+BTN_CATALOG = "🛍 Tovarlar"
+BTN_ABOUT = "ℹ️ Biz haqimizda"
+BTN_CONTACTS = "📞 Telefon"
+BTN_CANCEL = "❌ Bekor qilish"
+BTN_SKIP = "⏭ O'tkazib yuborish"
+BTN_SEND_PHONE = "📱 Raqamimni yuborish"
+
+BTN_ADD = "➕ Tovar qo'shish"
+BTN_DELETE = "🗑 Tovarni o'chirish"
+BTN_ALL = "📦 Barcha tovarlar"
+BTN_SET_PHONE = "☎️ Telefon raqamni o'zgartirish"
+BTN_STATS = "📊 Statistika"
+BTN_EXIT_ADMIN = "⬅️ Admin paneldan chiqish"
+
 
 def main_menu() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -237,306 +279,400 @@ def main_menu() -> ReplyKeyboardMarkup:
     kb.row(KeyboardButton(BTN_ABOUT), KeyboardButton(BTN_CONTACTS))
     return kb
 
+
+def admin_menu_kb() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton(BTN_ADD))
+    kb.row(KeyboardButton(BTN_DELETE), KeyboardButton(BTN_ALL))
+    kb.add(KeyboardButton(BTN_SET_PHONE))
+    kb.row(KeyboardButton(BTN_STATS), KeyboardButton(BTN_CATALOG))
+    kb.add(KeyboardButton(BTN_EXIT_ADMIN))
+    return kb
+
+
+def menu_for(user_id: int) -> ReplyKeyboardMarkup:
+    return admin_menu_kb() if is_admin(user_id) else main_menu()
+
+
 def phone_kb() -> ReplyKeyboardMarkup:
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, input_field_placeholder="or type: +998 90 123 45 67")
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, input_field_placeholder="+998 90 123 45 67")
     kb.add(KeyboardButton(BTN_SEND_PHONE, request_contact=True))
     kb.add(KeyboardButton(BTN_CANCEL))
     return kb
+
 
 def skip_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(KeyboardButton(BTN_SKIP), KeyboardButton(BTN_CANCEL))
     return kb
 
-def categories_kb(categories) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    for c in categories:
-        kb.insert(InlineKeyboardButton(f"{c['name']} ({c['cnt']})", callback_data=f"cat:{c['id']}:0"))
-    return kb
-
-def product_kb(product_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🛒 Order", callback_data=f"order:{product_id}"))
-    return kb
-
-def pagination_kb(category_id: int, next_offset: Optional[int]) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=1)
-    if next_offset is not None:
-        kb.add(InlineKeyboardButton("➡️ Show more", callback_data=f"cat:{category_id}:{next_offset}"))
-    kb.add(InlineKeyboardButton("⬅️ Categories", callback_data="back:cats"))
-    return kb
-
-def admin_menu_kb() -> ReplyKeyboardMarkup:
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton(BTN_ADD), KeyboardButton(BTN_DELETE))
-    kb.row(KeyboardButton(BTN_ALL), KeyboardButton(BTN_STATS))
-    kb.add(KeyboardButton(BTN_EXIT_ADMIN))
-    return kb
 
 def cancel_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton(BTN_CANCEL))
     return kb
 
-bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
-# --- HANDLERS: USER ---
-async def cmd_start(message: Message) -> None:
-    db: Database = dp["db"]
-    await db.upsert_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
-    await message.answer(
-        f"Assalomu alaykum, <b>{escape(message.from_user.first_name)}</b>!\n\n"
-        f"Xush kelibsiz! Marhamat, katalogimizdagi mahsulotlarni ko'rishingiz mumkin.",
-        reply_markup=main_menu(),
-    )
 
-async def cmd_about(message: Message) -> None:
-    await message.answer(ABOUT_TEXT, reply_markup=main_menu())
-
-async def cmd_contacts(message: Message) -> None:
-    await message.answer(CONTACTS_TEXT, reply_markup=main_menu())
-
-async def cmd_catalog(message: Message) -> None:
-    db: Database = dp["db"]
-    cats = await db.get_categories(only_nonempty=True)
-    if not cats:
-        await message.answer("😔 Hozircha katalogda mahsulotlar mavjud emas.")
-        return
-    await message.answer("📁 Kategoriyani tanlang:", reply_markup=categories_kb(cats))
-
-async def show_category_products(callback: CallbackQuery) -> None:
-    db: Database = dp["db"]
-    _, cat_id_str, offset_str = callback.data.split(":")
-    cat_id, offset = int(cat_id_str), int(offset_str)
-
-    products = await db.get_products_by_category(cat_id, PAGE_SIZE, offset)
-    if not products and offset == 0:
-        await callback.answer("Bu kategoriyada mahsulotlar yo'q.", show_alert=True)
-        return
-
-    for p in products:
-        await callback.message.answer_photo(
-            photo=p["photo_id"],
-            caption=product_caption(p),
-            reply_markup=product_kb(p["id"]),
+def categories_kb(categories) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    for c in categories:
+        kb.insert(
+            InlineKeyboardButton(f"{c['name']} ({c['cnt']})", callback_data=f"cat:{c['id']}:0")
         )
+    return kb
 
-    total = await db.count_products_in_category(cat_id)
-    next_offset = offset + PAGE_SIZE if offset + PAGE_SIZE < total else None
 
-    await callback.message.answer(
-        f"Sahifa: {offset // PAGE_SIZE + 1} / max {(total - 1) // PAGE_SIZE + 1}",
-        reply_markup=pagination_kb(cat_id, next_offset),
-    )
-    await callback.answer()
+def product_kb(product_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🛒 Buyurtma berish", callback_data=f"order:{product_id}"))
+    return kb
 
-async def back_to_categories(callback: CallbackQuery) -> None:
-    db: Database = dp["db"]
-    cats = await db.get_categories(only_nonempty=True)
-    await callback.message.edit_text("📁 Kategoriyani tanlang:", reply_markup=categories_kb(cats))
-    await callback.answer()
 
-async def start_order(callback: CallbackQuery, state: FSMContext) -> None:
-    db: Database = dp["db"]
-    product_id = int(callback.data.split(":")[1])
-    product = await db.get_product(product_id)
-    if not product:
-        await callback.answer("Mahsulot topilmadi.", show_alert=True)
-        return
+def pagination_kb(category_id: int, next_offset: Optional[int]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    if next_offset is not None:
+        kb.add(InlineKeyboardButton("➡️ Yana ko'rsatish", callback_data=f"cat:{category_id}:{next_offset}"))
+    kb.add(InlineKeyboardButton("⬅️ Kategoriyalar", callback_data="back:cats"))
+    return kb
 
-    async with state.proxy() as data:
-        data["product"] = dict(product)
 
-    await OrderStates.phone.set()
-    await callback.message.answer(
-        "📱 Buyurtma berish uchun telefon raqamingizni yuboring (masalan: +998 90 123 45 67):",
-        reply_markup=phone_kb(),
-    )
-    await callback.answer()
+# ================= BOT =================
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN topilmadi! Render -> Environment ga BOT_TOKEN qo'shing.")
 
-async def cancel_order(message: Message, state: FSMContext) -> None:
+bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
+dp = Dispatcher(bot, storage=MemoryStorage())
+db = Database(DB_PATH)
+
+
+# ---------- cancel (har qanday holatda, eng birinchi) ----------
+@dp.message_handler(text=BTN_CANCEL, state="*")
+async def cancel_any(message: Message, state: FSMContext):
     await state.finish()
-    await message.answer("Buyurtma bekor qilindi.", reply_markup=main_menu())
+    await message.answer("Bekor qilindi.", reply_markup=menu_for(message.from_user.id))
 
-async def process_phone(message: Message, state: FSMContext) -> None:
-    phone = message.contact.phone_number if message.contact else message.text
-    if not phone or len(phone.strip()) < 7:
-        await message.answer("Iltimos, to'g'ri telefon raqam kiriting yoki tugmani bosing.")
-        return
 
-    async with state.proxy() as data:
-        data["phone"] = phone
-
-    await OrderStates.comment.set()
-    await message.answer("💬 Qo'shimcha izoh yoki manzil yozib qoldiring (yoki 'Skip' tugmasini bosing):", reply_markup=skip_kb())
-
-async def process_comment(message: Message, state: FSMContext) -> None:
-    db: Database = dp["db"]
-    comment = "" if message.text == BTN_SKIP else message.text
-    async with state.proxy() as data:
-        product = data["product"]
-        phone = data["phone"]
-
-    user_id = message.from_user.id
-    await db.create_order(user_id, product, phone, comment)
+# ---------- ADMIN: tovar qo'shish (FSM) ----------
+@dp.message_handler(lambda m: is_admin(m.from_user.id), text=BTN_ADD, state="*")
+async def add_start(message: Message, state: FSMContext):
     await state.finish()
-
-    await message.answer("✅ Buyurtmangiz muvaffaqiyatli qabul qilindi! Tez orada operatorlarimiz siz bilan bog'lanishadi.", reply_markup=main_menu())
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🚨 <b>Yangi buyurtma!</b>\n\n"
-                f"🛍 Mahsulot: {product['name']}\n"
-                f"💰 Narxi: {format_price(product['price'])}\n"
-                f"👤 Mijoz: {message.from_user.full_name} (@{message.from_user.username or 'yoq'})\n"
-                f"📱 Tel: {phone}\n"
-                f"💬 Izoh: {comment}"
-            )
-        except Exception:
-            pass
-
-# --- HANDLERS: ADMIN PANEL ---
-async def cmd_admin(message: Message) -> None:
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("❌ Kechirasiz, siz admin emassiz!")
-        return
-    await message.answer("👑 Admin paneliga xush kelibsiz!", reply_markup=admin_menu_kb())
-
-async def exit_admin(message: Message) -> None:
-    await message.answer("Admin panelidan chiqildi.", reply_markup=main_menu())
-
-async def admin_stats(message: Message) -> None:
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    db: Database = dp["db"]
-    s = await db.get_stats()
-    text = (
-        f"📊 <b>Statistika:</b>\n\n"
-        f"👥 Foydalanuvchilar: {s['users']}\n"
-        f"📦 Mahsulotlar: {s['products']}\n"
-        f"📁 Kategoriyalar: {s['categories']}\n"
-        f"🛒 Jami buyurtmalar: {s['orders']}\n"
-        f"📥 Bugungi buyurtmalar: {s['orders_today']}\n"
-        f"💰 Tushum: {format_price(s['revenue'])}"
-    )
-    await message.answer(text)
-
-@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == BTN_ADD)
-async def start_add_product(message: Message):
     await message.answer("Yangi tovar nomini kiriting:", reply_markup=cancel_kb())
     await AddProduct.name.set()
 
-@dp.message_handler(state=AddProduct.name)
-async def set_product_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await message.answer("Endi tovar kategoriyasini kiriting (masalan: Kiyimlar):")
+
+@dp.message_handler(state=AddProduct.name, content_types=["text"])
+async def add_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.answer("Kategoriyani kiriting (masalan: Kiyimlar):")
     await AddProduct.category.set()
 
-@dp.message_handler(state=AddProduct.category)
-async def set_product_category(message: Message, state: FSMContext):
-    await state.update_data(category=message.text)
-    await message.answer("Tovar uchun qisqacha tavsif (description) kiriting:")
+
+@dp.message_handler(state=AddProduct.category, content_types=["text"])
+async def add_category(message: Message, state: FSMContext):
+    await state.update_data(category=message.text.strip())
+    await message.answer("Tovar tavsifini kiriting:")
     await AddProduct.description.set()
 
-@dp.message_handler(state=AddProduct.description)
-async def set_product_description(message: Message, state: FSMContext):
-    await state.update_data(description=message.text)
-    await message.answer("Tovar narxini raqamlarda kiriting (masalan: 150000):")
+
+@dp.message_handler(state=AddProduct.description, content_types=["text"])
+async def add_description(message: Message, state: FSMContext):
+    await state.update_data(description=message.text.strip())
+    await message.answer("Narxini raqamlarda kiriting (masalan: 150000):")
     await AddProduct.price.set()
 
-@dp.message_handler(state=AddProduct.price)
-async def set_product_price(message: Message, state: FSMContext):
+
+@dp.message_handler(state=AddProduct.price, content_types=["text"])
+async def add_price(message: Message, state: FSMContext):
     price = parse_price(message.text)
     if not price:
-        await message.answer("Iltimos, narxni to'g'ri raqam shaklida kiriting:")
+        await message.answer("Narxni to'g'ri raqam bilan kiriting (masalan: 150000):")
         return
     await state.update_data(price=price)
     await message.answer("Endi tovar rasmini (foto) yuboring:")
     await AddProduct.photo.set()
 
-@dp.message_handler(content_types=['photo'], state=AddProduct.photo)
-async def save_product_handler(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    data = await state.get_data()
-    db: Database = dp["db"]
-    
-    cat_id = await db.get_or_create_category(data["category"])
-    await db.add_product(data["name"], cat_id, data["description"], data["price"], photo_id)
-    
-    await message.answer("✅ Tovar muvaffaqiyatli qo'shildi!", reply_markup=admin_menu_kb())
-    await state.finish()
 
-@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == BTN_DELETE)
-async def list_products_to_delete(message: Message):
-    db: Database = dp["db"]
+@dp.message_handler(state=AddProduct.photo, content_types=["photo"])
+async def add_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    cat_id = await db.get_or_create_category(data["category"])
+    await db.add_product(
+        data["name"], cat_id, data["description"], data["price"], message.photo[-1].file_id
+    )
+    await state.finish()
+    await message.answer("✅ Tovar qo'shildi!", reply_markup=admin_menu_kb())
+
+
+@dp.message_handler(state=AddProduct.photo)
+async def add_photo_wrong(message: Message):
+    await message.answer("Iltimos, rasm (foto) yuboring.")
+    # ---------- ADMIN: do'kon telefon raqamini o'zgartirish ----------
+@dp.message_handler(lambda m: is_admin(m.from_user.id), text=BTN_SET_PHONE, state="*")
+async def setphone_start(message: Message, state: FSMContext):
+    await state.finish()
+    current = await db.get_setting("shop_phone", "kiritilmagan")
+    await message.answer(
+        f"Hozirgi raqam: <b>{escape(current)}</b>\n\nYangi telefon raqamni yozing "
+        "(masalan: +998 90 123 45 67):",
+        reply_markup=cancel_kb(),
+    )
+    await SetShopPhone.phone.set()
+
+
+@dp.message_handler(state=SetShopPhone.phone, content_types=["text"])
+async def setphone_save(message: Message, state: FSMContext):
+    if not valid_phone(message.text):
+        await message.answer("Raqam noto'g'ri. Qaytadan kiriting (masalan: +998 90 123 45 67):")
+        return
+    await db.set_setting("shop_phone", message.text.strip())
+    await state.finish()
+    await message.answer("✅ Telefon raqam saqlandi!", reply_markup=admin_menu_kb())
+
+
+# ---------- ADMIN: o'chirish, ko'rish, statistika ----------
+@dp.message_handler(lambda m: is_admin(m.from_user.id), text=BTN_DELETE, state="*")
+async def delete_list(message: Message, state: FSMContext):
+    await state.finish()
     products = await db.get_all_products()
     if not products:
-        await message.answer("Hozircha o'chirish uchun tovarlar yo'q.", reply_markup=admin_menu_kb())
+        await message.answer("O'chirish uchun tovarlar yo'q.", reply_markup=admin_menu_kb())
         return
-    
-    keyboard = InlineKeyboardMarkup(row_width=1)
+    kb = InlineKeyboardMarkup(row_width=1)
     for p in products:
-        keyboard.add(InlineKeyboardButton(text=f"❌ O'chirish: {p['name']} ({format_price(p['price'])})", callback_data=f"delprod:{p['id']}"))
-    
-    await message.answer("O'chirmoqchi bo'lgan tovarni tanlang:", reply_markup=keyboard)
+        kb.add(
+            InlineKeyboardButton(
+                f"❌ {p['name']} ({format_price(p['price'])})", callback_data=f"delprod:{p['id']}"
+            )
+        )
+    await message.answer("O'chirmoqchi bo'lgan tovarni tanlang:", reply_markup=kb)
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("delprod:"))
-async def delete_product_callback(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("delprod:"), state="*")
+async def delete_confirm(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
         await callback.answer("Siz admin emassiz!", show_alert=True)
         return
-    product_id = int(callback.data.split(":")[1])
-    db: Database = dp["db"]
-    await db.delete_product(product_id)
-    await callback.answer("Tovar o'chirildi!", show_alert=True)
-    await callback.message.edit_text("✅ Tovar muvaffaqiyatli o'chirib tashlandi.")
+    await db.delete_product(int(callback.data.split(":")[1]))
+    await callback.answer("Tovar o'chirildi!")
+    await callback.message.edit_text("✅ Tovar o'chirildi. Yana o'chirish uchun tugmani qayta bosing.")
 
-@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == BTN_ALL)
-async def admin_all_products(message: Message):
-    db: Database = dp["db"]
+
+@dp.message_handler(lambda m: is_admin(m.from_user.id), text=BTN_ALL, state="*")
+async def admin_all(message: Message, state: FSMContext):
+    await state.finish()
     products = await db.get_all_products()
     if not products:
-        await message.answer("Hozircha tovarlar mavjud emas.")
+        await message.answer("Hozircha tovarlar yo'q.")
         return
     for p in products:
-        await message.answer_photo(
-            photo=p["photo_id"],
-            caption=product_caption(p)
+        await message.answer_photo(photo=p["photo_id"], caption=product_caption(p))
+
+
+@dp.message_handler(lambda m: is_admin(m.from_user.id), text=BTN_STATS, state="*")
+async def admin_stats(message: Message, state: FSMContext):
+    await state.finish()
+    s = await db.get_stats()
+    await message.answer(
+        "📊 <b>Statistika</b>\n\n"
+        f"👥 Foydalanuvchilar: {s['users']}\n"
+        f"📦 Tovarlar: {s['products']}\n"
+        f"📁 Kategoriyalar: {s['categories']}\n"
+        f"🛒 Jami buyurtmalar: {s['orders']}\n"
+        f"📥 Bugungi buyurtmalar: {s['orders_today']}\n"
+        f"💰 Tushum: {format_price(s['revenue'])}"
+    )
+
+
+@dp.message_handler(text=BTN_EXIT_ADMIN, state="*")
+async def admin_exit(message: Message, state: FSMContext):
+    await state.finish()
+    await message.answer("Oddiy menyu.", reply_markup=main_menu())
+
+
+@dp.message_handler(commands=["admin"], state="*")
+async def cmd_admin(message: Message, state: FSMContext):
+    await state.finish()
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Siz admin emassiz!")
+        return
+    await message.answer("👑 Admin paneliga xush kelibsiz!", reply_markup=admin_menu_kb())
+
+
+# ---------- BUYURTMA (FSM) ----------
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("order:"), state="*")
+async def order_start(callback: CallbackQuery, state: FSMContext):
+    product = await db.get_product(int(callback.data.split(":")[1]))
+    if not product:
+        await callback.answer("Tovar topilmadi.", show_alert=True)
+        return
+    await state.finish()
+    await state.update_data(product=dict(product))
+    await OrderStates.phone.set()
+    await callback.message.answer(
+        "📱 Buyurtma uchun telefon raqamingizni yuboring:", reply_markup=phone_kb()
+    )
+    await callback.answer()
+
+
+@dp.message_handler(state=OrderStates.phone, content_types=["contact", "text"])
+async def order_phone(message: Message, state: FSMContext):
+    phone = message.contact.phone_number if message.contact else message.text
+    if not valid_phone(phone):
+        await message.answer("To'g'ri telefon raqam kiriting yoki tugmani bosing.")
+        return
+    await state.update_data(phone=phone.strip())
+    await OrderStates.comment.set()
+    await message.answer(
+        "💬 Manzil yoki izoh yozing (yoki «O'tkazib yuborish» tugmasini bosing):",
+        reply_markup=skip_kb(),
+    )
+
+
+@dp.message_handler(state=OrderStates.comment, content_types=["text"])
+async def order_comment(message: Message, state: FSMContext):
+    comment = "" if message.text == BTN_SKIP else message.text
+    data = await state.get_data()
+    product, phone = data["product"], data["phone"]
+    await db.create_order(message.from_user.id, product, phone, comment)
+    await state.finish()
+
+    await message.answer(
+        "✅ Buyurtmangiz qabul qilindi! Tez orada siz bilan bog'lanamiz.",
+        reply_markup=menu_for(message.from_user.id),
+    )
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "yo'q"
+    text = (
+        "🚨 <b>Yangi buyurtma!</b>\n\n"
+        f"🛍 Tovar: {escape(product['name'])}\n"
+        f"💰 Narxi: {format_price(product['price'])}\n"
+        f"👤 Mijoz: {escape(message.from_user.full_name)} ({escape(username)})\n"
+        f"📱 Tel: {escape(phone)}\n"
+        f"💬 Izoh: {escape(comment) or '—'}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as e:
+            logging.warning("Adminga yuborilmadi %s: %s", admin_id, e)
+
+
+# ---------- OMMAVIY: start, tovarlar, telefon, biz haqimizda ----------
+@dp.message_handler(commands=["start"], state="*")
+async def cmd_start(message: Message, state: FSMContext):
+    await state.finish()
+    await db.upsert_user(
+        message.from_user.id, message.from_user.full_name, message.from_user.username
+    )
+    await message.answer(
+        f"Assalomu alaykum, <b>{escape(message.from_user.first_name)}</b>!\n\n"
+        "Xush kelibsiz! Tovarlarimizni ko'rish uchun «🛍 Tovarlar» tugmasini bosing.",
+        reply_markup=menu_for(message.from_user.id),
+    )
+
+
+@dp.message_handler(text=BTN_ABOUT, state="*")
+async def cmd_about(message: Message):
+    await message.answer(ABOUT_TEXT)
+
+
+@dp.message_handler(text=BTN_CONTACTS, state="*")
+async def cmd_contacts(message: Message):
+    phone = await db.get_setting("shop_phone", "")
+    if phone:
+        text = f"📞 <b>Aloqa</b>\n\nTelefon: {escape(phone)}"
+    else:
+        text = "📞 Telefon raqam hozircha kiritilmagan."
+    await message.answer(text)
+
+
+@dp.message_handler(text=BTN_CATALOG, state="*")
+async def cmd_catalog(message: Message, state: FSMContext):
+    await state.finish()
+    cats = await db.get_categories()
+    if not cats:
+        await message.answer("😔 Hozircha tovarlar yo'q.")
+        return
+    await message.answer("📁 Kategoriyani tanlang:", reply_markup=categories_kb(cats))
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("cat:"), state="*")
+async def show_category(callback: CallbackQuery):
+    _, cat_id_s, offset_s = callback.data.split(":")
+    cat_id, offset = int(cat_id_s), int(offset_s)
+
+    products = await db.get_products_by_category(cat_id, PAGE_SIZE, offset)
+    if not products:
+        await callback.answer("Bu kategoriyada tovar yo'q.", show_alert=True)
+        return
+
+    for p in products:
+        await callback.message.answer_photo(
+            photo=p["photo_id"], caption=product_caption(p), reply_markup=product_kb(p["id"])
         )
 
-# --- MAIN ---
-async def main() -> None:
-    db = Database(DB_PATH)
+    total = await db.count_products_in_category(cat_id)
+    next_offset = offset + PAGE_SIZE if offset + PAGE_SIZE < total else None
+    await callback.message.answer(
+        f"Sahifa: {offset // PAGE_SIZE + 1} / {(total - 1) // PAGE_SIZE + 1}",
+        reply_markup=pagination_kb(cat_id, next_offset),
+    )
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "back:cats", state="*")
+async def back_to_categories(callback: CallbackQuery):
+    cats = await db.get_categories()
+    if not cats:
+        await callback.message.edit_text("😔 Hozircha tovarlar yo'q.")
+    else:
+        await callback.message.edit_text("📁 Kategoriyani tanlang:", reply_markup=categories_kb(cats))
+    await callback.answer()
+
+
+# ================= RUN =================
+async def start_web_server() -> None:
+    """Render Web Service port kutadi. Bu kichik server UptimeRobot uchun ham kerak."""
+    from aiohttp import web
+
+    async def health(_request):
+        return web.Response(text="StilShop bot ishlayapti")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logging.info("Veb-server %s portda ishga tushdi", port)
+
+
+async def keep_alive() -> None:
+    """Har 10 daqiqada o'z manziliga so'rov yuboradi, Render uxlab qolmasin."""
+    import aiohttp
+
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        logging.info("RENDER_EXTERNAL_URL yo'q, keep-alive o'chirildi")
+        return
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    logging.info("Keep-alive: %s", resp.status)
+        except Exception as e:
+            logging.warning("Keep-alive xato: %s", e)
+
+
+async def on_startup(_: Dispatcher) -> None:
+    await start_web_server()
+    asyncio.create_task(keep_alive())
     await db.init()
-    dp["db"] = db
+    me = await bot.get_me()
+    logging.info("Bot ishga tushdi: @%s", me.username)
 
-    dp.register_message_handler(cmd_start, commands=["start"])
-    dp.register_message_handler(cmd_about, text=BTN_ABOUT)
-    dp.register_message_handler(cmd_contacts, text=BTN_CONTACTS)
-    dp.register_message_handler(cmd_catalog, text=BTN_CATALOG)
-    
-    dp.register_message_handler(cmd_admin, commands=["admin"])
-    dp.register_message_handler(cmd_admin, text=BTN_ADD)
-    dp.register_message_handler(exit_admin, text=BTN_EXIT_ADMIN)
-    dp.register_message_handler(admin_stats, text=BTN_STATS)
-    dp.register_message_handler(cancel_order, text=BTN_CANCEL, state="*")
-
-    dp.register_callback_query_handler(start_order, lambda c: c.data and c.data.startswith("order:"))
-    dp.register_message_handler(process_phone, state=OrderStates.phone, content_types=['text', 'contact'])
-    dp.register_message_handler(process_comment, state=OrderStates.comment)
-
-    dp.register_callback_query_handler(show_category_products, lambda c: c.data and c.data.startswith("cat:"))
-    dp.register_callback_query_handler(back_to_categories, lambda c: c.data == "back:cats")
-
-    print("Bot ishga tushdi...")
-    try:
-        await dp.start_polling()
-    finally:
-        await bot.session.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
     
